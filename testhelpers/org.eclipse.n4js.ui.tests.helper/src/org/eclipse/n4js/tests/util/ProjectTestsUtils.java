@@ -12,7 +12,6 @@ package org.eclipse.n4js.tests.util;
 
 import static com.google.common.base.Predicates.alwaysTrue;
 import static com.google.common.collect.FluentIterable.from;
-import static com.google.common.collect.Lists.newArrayList;
 import static org.eclipse.core.runtime.jobs.Job.getJobManager;
 import static org.eclipse.xtext.ui.testing.util.IResourcesSetupUtil.addNature;
 import static org.eclipse.xtext.ui.testing.util.IResourcesSetupUtil.monitor;
@@ -25,11 +24,13 @@ import java.lang.reflect.InvocationTargetException;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.StringJoiner;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.stream.Collectors;
 
 import org.apache.log4j.Logger;
 import org.eclipse.core.resources.IFile;
@@ -48,18 +49,18 @@ import org.eclipse.core.runtime.jobs.Job;
 import org.eclipse.emf.common.util.URI;
 import org.eclipse.emf.ecore.resource.Resource;
 import org.eclipse.emf.ecore.resource.ResourceSet;
-import org.eclipse.n4js.n4mf.DeclaredVersion;
-import org.eclipse.n4js.n4mf.N4mfFactory;
-import org.eclipse.n4js.n4mf.ProjectDescription;
-import org.eclipse.n4js.n4mf.ProjectType;
-import org.eclipse.n4js.n4mf.SourceContainerDescription;
-import org.eclipse.n4js.n4mf.SourceContainerType;
+import org.eclipse.n4js.N4JSGlobals;
+import org.eclipse.n4js.json.JSON.JSONDocument;
+import org.eclipse.n4js.packagejson.PackageJsonBuilder;
 import org.eclipse.n4js.ui.editor.N4JSDirtyStateEditorSupport;
 import org.eclipse.n4js.ui.internal.N4JSActivator;
+import org.eclipse.n4js.ui.utils.TimeoutRuntimeException;
+import org.eclipse.n4js.ui.utils.UIUtils;
 import org.eclipse.ui.dialogs.IOverwriteQuery;
 import org.eclipse.ui.texteditor.MarkerUtilities;
 import org.eclipse.ui.wizards.datatransfer.FileSystemStructureProvider;
 import org.eclipse.ui.wizards.datatransfer.ImportOperation;
+import org.eclipse.xtext.resource.SaveOptions;
 import org.eclipse.xtext.ui.MarkerTypes;
 import org.eclipse.xtext.ui.XtextProjectHelper;
 import org.eclipse.xtext.ui.resource.IResourceSetProvider;
@@ -67,11 +68,18 @@ import org.junit.Assert;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Predicate;
+import com.google.common.base.Stopwatch;
+import com.google.common.collect.Lists;
 
 /**
  * Utilities for for tests that setup / assert N4JS projects.
  */
 public class ProjectTestsUtils {
+
+	/** Default wait time used in waiting for jobs. */
+	public static final long MAX_WAIT_2_MINUTES = 100 * 60 * 2;
+	/** Default interval used to check state of jobs. */
+	public static final long CHECK_INTERVAL_100_MS = 100L;
 
 	private static Logger LOGGER = Logger.getLogger(ProjectTestsUtils.class);
 
@@ -186,85 +194,65 @@ public class ProjectTestsUtils {
 	}
 
 	/***/
-	public static IProject createJSProject(String projectName) throws CoreException {
+	public static IProject createJSProject(String projectName)
+			throws CoreException {
 		return createJSProject(projectName, "src", "src-gen", null);
 	}
 
 	/**
-	 * Creates a new N4JS project with the given name and project type. The source and output folders will be named as
-	 * {@code src} and {@code src-gen}. The Xtext project nature will be already configured on the N4JS project.
-	 *
-	 * @param projectName
-	 *            the name of the project.
-	 * @param type
-	 *            the desired project type of the new project.
-	 * @return the new N4JS project with the desired type.
-	 * @throws CoreException
-	 *             if the project creation failed.
-	 */
-	public static IProject createN4JSProject(String projectName, ProjectType type) throws CoreException {
-		final IProject project = createJSProject(projectName, "src", "src-gen", t -> t.setProjectType(type));
-		configureProjectWithXtext(project);
-		return project;
-	}
-
-	/**
-	 * @param manifestAdjustments
-	 *            for details see method {@link #createManifestN4MFFile(IProject, String, String, Consumer)}.
+	 * @param packageJSONAdjustments
+	 *            for details see method {@link #createProjectDescriptionFile(IProject, String, String, Consumer)}.
 	 */
 	public static IProject createJSProject(String projectName, String sourceFolder, String outputFolder,
-			Consumer<ProjectDescription> manifestAdjustments) throws CoreException {
+			Consumer<PackageJsonBuilder> packageJSONAdjustments) throws CoreException {
 		IProject result = createSimpleProject(projectName);
 		createSubFolder(result.getProject(), sourceFolder);
 		createSubFolder(result.getProject(), outputFolder);
-		createManifestN4MFFile(result.getProject(), sourceFolder, outputFolder, manifestAdjustments);
+		createProjectDescriptionFile(result.getProject(), sourceFolder, outputFolder, packageJSONAdjustments);
 		return result;
 	}
 
 	/***/
-	public static void createManifestN4MFFile(IProject project) throws CoreException {
-		createManifestN4MFFile(project, "src", "src-gen", null);
+	public static void createProjectDescriptionFile(IProject project) throws CoreException {
+		createProjectDescriptionFile(project, "src", "src-gen", null);
 	}
 
 	/**
-	 * @param manifestAdjustments
-	 *            before saving the manifest this procedure will be called to allow adjustments to the manifest's
-	 *            properties (the ProjectDescription object passed to the procedure will already contain all default
-	 *            values). May be <code>null</code> if no adjustments are required.
+	 * @param packageJSONBuilderAdjustments
+	 *            This procedure will be invoked with the {@link PackageJsonBuilder} instances that is used to create
+	 *            the project description {@link JSONDocument} instance. The builder instance will be pre-configured
+	 *            with default values (cf {@link PackageJSONTestUtils#defaultPackageJson}). May be <code>null</code> if
+	 *            no adjustments are required.
 	 */
-	public static void createManifestN4MFFile(IProject project, String sourceFolder, String outputFolder,
-			Consumer<ProjectDescription> manifestAdjustments) throws CoreException {
-		IFile config = project.getFile("manifest.n4mf");
-		URI uri = URI.createPlatformResourceURI(config.getFullPath().toString(), true);
-		ProjectDescription projectDesc = N4mfFactory.eINSTANCE.createProjectDescription();
-		projectDesc.setVendorId("org.eclipse.n4js");
-		projectDesc.setVendorName("Eclipse N4JS Project");
-		projectDesc.setProjectId(project.getName());
-		projectDesc.setProjectType(ProjectType.LIBRARY);
-		DeclaredVersion projectVersion = N4mfFactory.eINSTANCE.createDeclaredVersion();
-		projectVersion.setMajor(0);
-		projectVersion.setMinor(0);
-		projectVersion.setMicro(1);
-		projectDesc.setProjectVersion(projectVersion);
-		projectDesc.setOutputPath(outputFolder);
-		SourceContainerDescription sourceProjectPath = N4mfFactory.eINSTANCE.createSourceContainerDescription();
-		sourceProjectPath.setSourceContainerType(SourceContainerType.SOURCE);
-		sourceProjectPath.getPathsRaw().add(sourceFolder);
-		projectDesc.getSourceContainers().add(sourceProjectPath);
-		if (manifestAdjustments != null)
-			manifestAdjustments.accept(projectDesc);
-		ResourceSet rs = createResourceSet(project);
-		Resource res = rs.createResource(uri);
-		res.getContents().add(projectDesc);
+	public static void createProjectDescriptionFile(IProject project, String sourceFolder, String outputFolder,
+			Consumer<PackageJsonBuilder> packageJSONBuilderAdjustments) throws CoreException {
+
+		IFile projectDescriptionWorkspaceFile = project.getFile(N4JSGlobals.PACKAGE_JSON);
+		URI uri = URI.createPlatformResourceURI(projectDescriptionWorkspaceFile.getFullPath().toString(), true);
+
+		final PackageJsonBuilder packageJsonBuilder = PackageJSONTestUtils
+				.defaultPackageJson(project.getName(), sourceFolder, outputFolder);
+
+		if (packageJSONBuilderAdjustments != null)
+			packageJSONBuilderAdjustments.accept(packageJsonBuilder);
+
+		final JSONDocument document = packageJsonBuilder.buildModel();
+
+		final ResourceSet rs = createResourceSet(project);
+		final Resource projectDescriptionResource = rs.createResource(uri);
+		projectDescriptionResource.getContents().add(document);
 
 		try {
-			res.save(Collections.EMPTY_MAP);
+			// save formatted package.json file to disk
+			projectDescriptionResource.save(SaveOptions.newBuilder().format().getOptions().toOptionsMap());
 		} catch (IOException e) {
 			e.printStackTrace();
 		}
+
 		project.refreshLocal(IResource.DEPTH_INFINITE, monitor());
 		waitForAutoBuild();
-		Assert.assertTrue("manifest.n4mf should have been created", config.exists());
+		Assert.assertTrue("project description file (package.json) should have been created",
+				projectDescriptionWorkspaceFile.exists());
 	}
 
 	// moved here from AbstractBuilderParticipantTest:
@@ -293,7 +281,6 @@ public class ProjectTestsUtils {
 	public static void waitForAutoBuild() {
 		final int maxTry = 3;
 		int currentTry = 1;
-		int maxWait = 100 * 60 * 2;
 		long start = System.currentTimeMillis();
 		long end = start;
 		boolean wasInterrupted = false;
@@ -314,13 +301,13 @@ public class ProjectTestsUtils {
 				} catch (InterruptedException e) {
 					wasInterrupted = true;
 				}
-			} while (wasInterrupted && (end - start) < maxWait);
+			} while (wasInterrupted && (end - start) < MAX_WAIT_2_MINUTES);
 			if (!foundJob) {
 				LOGGER.debug("Auto build job hasn't been found, but maybe already run.");
 
 				currentTry += 1;
 				try {
-					Thread.sleep(100);
+					Thread.sleep(CHECK_INTERVAL_100_MS);
 				} catch (InterruptedException e) {
 					e.printStackTrace();
 					LOGGER.debug("Couldn't sleep, abort waiting");
@@ -360,42 +347,80 @@ public class ProjectTestsUtils {
 		}
 	}
 
+	/** Delegates to {@link #waitForAllJobs(long)} with default values {@link #MAX_WAIT_2_MINUTES}. */
+	public static void waitForAllJobs() {
+		waitForAllJobs(MAX_WAIT_2_MINUTES);
+	}
+
 	/**
 	 * Waits for all the jobs that have status {@link Job#RUNNING} of {@link Job#WAITING}. Uses {@link Thread#sleep}, so
 	 * use with care.
+	 *
+	 * Intentionally throws runtime exception if there are still jobs running after given timeout. Don't catch it,
+	 * increase timeout in your tests.
+	 *
+	 * @param maxWait
+	 *            maximum wait time in {@link TimeUnit#MILLISECONDS}
 	 */
-	public static void waitForAllJobs() {
-		int maxWait = 100 * 60 * 2;
-		long start = System.currentTimeMillis();
-		long end = start;
+	public static void waitForAllJobs(final long maxWait) {
+		if (maxWait < 1)
+			throw new IllegalArgumentException("Wait time needs to be > 0, was " + maxWait + ".");
+
+		final boolean runsInUI = UIUtils.runsInUIThread();
+		if (runsInUI)
+			LOGGER.warn("Waiting for jobs runs in the UI thread which can lead to UI thread starvation.");
+
+		List<String> foundJobs = listJobsRunningWaiting();
+		if (foundJobs.isEmpty()) {
+			LOGGER.info("No running nor waiting jobs found, maybe all have already finished.");
+			return;
+		}
 		boolean wasInterrupted = false;
+		boolean wasCancelled = false;
 		boolean foundJob = false;
+		Stopwatch sw = Stopwatch.createStarted();
 		do {
 			try {
-				List<String> foundJobs = listJobsRunningWaiting();
-				if (!foundJobs.isEmpty()) {
-					foundJob = true;
-					// Job.getJobManager().join(null, null);
-					Thread.sleep(100L);
+				foundJobs = listJobsRunningWaiting();
+				foundJob = !foundJobs.isEmpty();
+				if (foundJob) {
+					if (LOGGER.isInfoEnabled())
+						LOGGER.info("Found " + foundJobs.size() + " after " + sw + ", going to sleep for a while.");
+
+					if (runsInUI)
+						UIUtils.waitForUiThread();
+					else
+						Thread.sleep(CHECK_INTERVAL_100_MS);
 				}
-				wasInterrupted = false;
-				end = System.currentTimeMillis();
 			} catch (OperationCanceledException e) {
-				e.printStackTrace();
+				wasCancelled = true;
+				LOGGER.error("Waiting for jobs was cancelled after " + sw + ".", e);
 			} catch (InterruptedException e) {
 				wasInterrupted = true;
+				LOGGER.error("Waiting for jobs was interrupted after " + sw + ".", e);
 			}
-		} while (wasInterrupted && (end - start) < maxWait);
-		if (!foundJob) {
-			LOGGER.debug("No running nor waiting jobs found, maybe all have already finished.");
+		} while (sw.elapsed(TimeUnit.MILLISECONDS) < maxWait
+				&& foundJob == true
+				&& wasInterrupted == false
+				&& wasCancelled == false);
+		sw.stop();
+		if (foundJob) {
+			if (LOGGER.isInfoEnabled()) {
+				StringJoiner sj = new StringJoiner("\n");
+				sj.add("Expected no jobs, found " + foundJobs.size() + ".");
+				foundJobs.forEach(sj::add);
+				LOGGER.info(sj.toString());
+			}
+			if (!(wasCancelled == true || wasInterrupted == true))
+				throw new TimeoutRuntimeException("Expected no jobs, found " + foundJobs.size() + " after " + sw + ".");
 		}
 	}
 
-	private static List<String> listJobsRunningWaiting() {
-		return from(newArrayList(getJobManager().find(null)))
-				.filter(job -> job.getState() != Job.SLEEPING || job.getState() != Job.NONE)
-				.transform(job -> " - " + job.getName() + " : " + job.getState())
-				.toList();
+	/** @return list of running jobs descriptions */
+	public final static List<String> listJobsRunningWaiting() {
+		return Arrays.stream(getJobManager().find(null))
+				.filter(job -> !(job.getState() == Job.SLEEPING || job.getState() == Job.NONE))
+				.map(job -> " - " + job.getName() + " : " + job.getState()).collect(Collectors.toList());
 	}
 
 	/***/
@@ -483,5 +508,38 @@ public class ProjectTestsUtils {
 	/***/
 	public static void deleteProject(IProject project) throws CoreException {
 		project.delete(true, true, new NullProgressMonitor());
+	}
+
+	/**
+	 * Returns with the {@link IProject project} from the {@link IWorkspace workspace} with the given project name.
+	 * Makes no assertions whether the project can be accessed or not.
+	 *
+	 * @param projectName
+	 *            the name of the desired project.
+	 * @return the project we are looking for. Could be non-{@link IProject#isAccessible() accessible} project.
+	 */
+	public static IProject getProjectByName(final String projectName) {
+		return ResourcesPlugin.getWorkspace().getRoot().getProject(projectName);
+	}
+
+	/**
+	 * Returns with an array or project form the workspace. for the given subset of unique project names. Sugar for
+	 *
+	 * @param projectName
+	 *            the name of the project.
+	 * @param otherName
+	 *            the name of another project.
+	 * @param rest
+	 *            additional names of desired projects.
+	 * @return an array of projects, could contain non-accessible project.
+	 */
+	public static IProject[] getProjectsByName(final String projectName, final String otherName,
+			final String... rest) {
+		final List<String> projectNames = Lists.asList(projectName, otherName, rest);
+		final IProject[] projects = new IProject[projectNames.size()];
+		for (int i = 0; i < projects.length; i++) {
+			projects[i] = getProjectByName(projectNames.get(i));
+		}
+		return projects;
 	}
 }
